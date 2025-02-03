@@ -3,10 +3,6 @@ import json
 from typing import Any, Dict, List, Optional
 
 
-##############################################################################
-# Dynamic Import Helper
-##############################################################################
-
 def dynamic_import(fully_qualified_name: str):
     """
     Import a class given its fully qualified name, e.g., "my_module.AddOneNode".
@@ -16,11 +12,6 @@ def dynamic_import(fully_qualified_name: str):
     module = importlib.import_module(module_name)
     cls = getattr(module, class_name)
     return cls
-
-
-##############################################################################
-# Base Node Class
-##############################################################################
 
 class Node:
     """
@@ -114,10 +105,6 @@ class Node:
         return node_obj
 
 
-##############################################################################
-# Composite Node
-##############################################################################
-
 class CompositeNode(Node):
     """
     A Node that runs its sub_nodes in sequence.
@@ -130,11 +117,6 @@ class CompositeNode(Node):
             current_ctx = node(current_ctx)
         print(f"[CompositeNode {self.name}] Sequence result: {current_ctx}")
         return current_ctx
-
-
-##############################################################################
-# Example: AddOneNode
-##############################################################################
 
 class AddOneNode(Node):
     """
@@ -158,10 +140,6 @@ class AddOneNode(Node):
         return new_ctx
 
 
-##############################################################################
-# Example: MultiplyNode
-##############################################################################
-
 class MultiplyNode(Node):
     """
     A Node that multiplies context["value"] by a factor.
@@ -182,11 +160,6 @@ class MultiplyNode(Node):
         new_ctx["value"] = old_val * self.factor
         print(f"[MultiplyNode {self.name}] {old_val} * {self.factor} -> {new_ctx['value']}")
         return new_ctx
-
-
-##############################################################################
-# Example: AskUserNode (Tool Usage)
-##############################################################################
 
 class AskUserNode(Node):
     """
@@ -221,11 +194,6 @@ class AskUserNode(Node):
         new_ctx[self.target_key] = user_reply
         print(f"[AskUserNode {self.name}] Received '{user_reply}' and stored in '{self.target_key}'.")
         return new_ctx
-
-
-##############################################################################
-# Demo
-##############################################################################
 
 if __name__ == "__main__":
     # 1. Build a pipeline that:
