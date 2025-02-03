@@ -1,247 +1,323 @@
 import importlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import (
+    TypeVar, Generic, Dict, Any, Type, get_type_hints, Optional, List
+)
+from dataclasses import dataclass, asdict, fields
+
+##############################################################################
+# 1) Dataclass-based "schema" definitions
+##############################################################################
+
+@dataclass
+class DataClassBase:
+    """
+    Mypy recognizes inheritors of this as valid dataclasses
+    so calls to fields(...) and asdict(...) are allowed.
+    """
+    pass
+
+@dataclass
+class PersonInput(DataClassBase):
+    name: str
+    age: int
+
+@dataclass
+class GreetingOutput(DataClassBase):
+    greeting: str
+
+@dataclass
+class FavoriteColorOutput(DataClassBase):
+    favorite_color: str
 
 
-def dynamic_import(fully_qualified_name: str):
-    """
-    Import a class given its fully qualified name, e.g., "my_module.AddOneNode".
-    Returns the class object.
-    """
-    module_name, class_name = fully_qualified_name.rsplit('.', 1)
-    module = importlib.import_module(module_name)
-    cls = getattr(module, class_name)
-    return cls
+##############################################################################
+# 2) Helper for dynamic import
+##############################################################################
 
-class Node:
+def dynamic_import(fqcn: str):
     """
-    A composable transformation: context -> context.
+    Import a class from a fully qualified class name, e.g. 'my_module.GreetNode'
+    """
+    module_name, class_name = fqcn.rsplit('.', 1)
+    mod = importlib.import_module(module_name)
+    return getattr(mod, class_name)
+
+
+##############################################################################
+# 3) Type variables and base Node class
+##############################################################################
+
+InSchema = TypeVar("InSchema", bound=DataClassBase)
+OutSchema = TypeVar("OutSchema", bound=DataClassBase)
+
+class Node(Generic[InSchema, OutSchema]):
+    """
+    A typed Node from InSchema -> OutSchema, with composable __call__.
     
-    - name: Optional name for debugging
-    - params: a dict of constructor parameters (JSON-serializable)
-    - sub_nodes: child nodes if this node is a "composite"
-    - node_type: a fully qualified Python class path (for dynamic import)
+    Instead of storing parameters as constructor arguments, we store them
+    in a generic dictionary 'config'. For (de)serialization, we rely on:
     
-    By default, this Node does:
-      1) If sub_nodes exist, run them in sequence on the context.
-      2) Otherwise, do nothing (identity pass).
-    Subclasses override __call__ to implement custom logic.
+      to_json() -> { "type": <fqcn>, "config": self.to_config() }
+      from_json(data) -> dynamic_import(data["type"]).from_config(data["config"])
+      
+    That way, each node can define how it uses 'config' in from_config() and to_config().
     """
     
-    def __init__(
-        self,
-        name: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        sub_nodes: Optional[List["Node"]] = None,
-        node_type: Optional[str] = None,
-    ):
-        self.name = name if name else self.__class__.__name__
-        self.params = params or {}
-        self.sub_nodes = sub_nodes or []
+    def __init__(self):
+        # We won't pass everything to __init__ in the base class.
+        # Instead, each node sets self.config, etc. in from_config().
+        pass
+
+    def run(self, inp: InSchema) -> OutSchema:
+        """
+        Subclasses override this with the actual transformation logic:
+          InSchema -> OutSchema
+        """
+        raise NotImplementedError()
+    
+    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        1. Build the InSchema from 'context'
+        2. run(...) -> OutSchema
+        3. Merge output fields into context
+        """
+        input_obj = self._build_input(context, self.in_schema)
+        output_obj = self.run(input_obj)
         
-        if node_type is None:
-            cls = self.__class__
-            self.node_type = f"{cls.__module__}.{cls.__name__}"
-        else:
-            self.node_type = node_type
+        out_dict = asdict(output_obj)
+        new_context = dict(context)
+        new_context.update(out_dict)
+        return new_context
+    
+    def _build_input(self, context: Dict[str, Any], schema_cls: Type[InSchema]) -> InSchema:
+        # Minimal check: ensure all fields in schema_cls are present in context
+        required_fields = {f.name: f.type for f in fields(schema_cls)}
+        init_kwargs = {}
+        for field_name, field_type in required_fields.items():
+            if field_name not in context:
+                raise ValueError(f"Missing required field '{field_name}' in context for node {self}.")
+            init_kwargs[field_name] = context[field_name]
+        
+        return schema_cls(**init_kwargs)
+    
+    @property
+    def in_schema(self) -> Type[InSchema]:
+        """
+        Subclasses must define or store their input schema type.
+        """
+        raise NotImplementedError()
 
-    def __call__(self, context: Any) -> Any:
+    @property
+    def out_schema(self) -> Type[OutSchema]:
         """
-        Default behavior: if sub_nodes exist, run them in order;
-        otherwise, return context unchanged.
+        Subclasses must define or store their output schema type.
         """
-        if self.sub_nodes:
-            current_ctx = context
-            for node in self.sub_nodes:
-                current_ctx = node(current_ctx)
-            return current_ctx
-        else:
-            return context  # identity
-
-    def __rshift__(self, other: "Node") -> "Node":
-        """
-        Compose self >> other: returns a CompositeNode that runs
-        'self' then 'other' in sequence.
-        """
-        return CompositeNode(
-            name=f"({self.name} >> {other.name})",
-            sub_nodes=[self, other]
-        )
+        raise NotImplementedError()
 
     def to_json(self) -> Dict[str, Any]:
         """
-        Serialize to a JSON-friendly dict. 
+        Return a JSON-serializable dict with "type" and "config".
         """
         return {
-            "node_type": self.node_type,
-            "name": self.name,
-            "params": self.params,
-            "sub_nodes": [child.to_json() for child in self.sub_nodes],
+            "type": f"{self.__class__.__module__}.{self.__class__.__name__}",
+            "config": self.to_config()
         }
-
+    
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "Node":
         """
-        Deserialize a Node from a JSON dict by:
-          1. dynamic_import(node_type)
-          2. constructing that class with the stored 'params' and 'sub_nodes'
+        Universal entry point: dynamic-import the class, then call from_config.
         """
-        node_type = data["node_type"]
-        node_cls = dynamic_import(node_type)  # load the actual class
+        node_type = data["type"]
+        config = data["config"]
+        NodeClass = dynamic_import(node_type)
+        return NodeClass.from_config(config)
+    
+    def to_config(self) -> Dict[str, Any]:
+        """
+        Subclasses should override to store their own config in a dict.
+        This might include sub-nodes if it's a composite node.
+        """
+        raise NotImplementedError()
+    
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "Node":
+        """
+        Subclasses override to reconstruct themselves from 'config'.
+        """
+        raise NotImplementedError("Subclasses must implement from_config().")
 
-        sub_nodes_data = data.get("sub_nodes", [])
-        child_nodes = [cls.from_json(sd) for sd in sub_nodes_data]
-
-        name = data["name"]
-        params = data["params"]
-
-        # Instantiate
-        node_obj = node_cls(
-            name=name,
-            params=params,
-            sub_nodes=child_nodes,
-            node_type=node_type  # keep the same type string
-        )
-        return node_obj
+    def __rshift__(self, other: "Node") -> "Node":
+        """
+        Compose: self >> other -> CompositeNode holding [self, other].
+        """
+        return CompositeNode([self, other])
 
 
-class CompositeNode(Node):
+##############################################################################
+# 4) CompositeNode
+##############################################################################
+
+class CompositeNode(Node[Any, Any]):
     """
-    A Node that runs its sub_nodes in sequence.
+    A node that runs its sub-nodes in sequence. The 'in_schema' is the first node's,
+    the 'out_schema' is the last node's. We skip strict static type checks for the
+    intermediate steps in this example.
     """
-    def __call__(self, context: Any) -> Any:
-        print(f"[CompositeNode {self.name}] Starting sequence.")
+    
+    def __init__(self, nodes: List[Node]):
+        super().__init__()
+        self.nodes = nodes  # each node can have its own typed in/out
+        # We define the in/out schemas as the first node's in_schema, last node's out_schema
+        if not nodes:
+            raise ValueError("CompositeNode requires at least one sub-node.")
+
+    @property
+    def in_schema(self) -> Type[Any]:
+        return self.nodes[0].in_schema
+
+    @property
+    def out_schema(self) -> Type[Any]:
+        return self.nodes[-1].out_schema
+
+    def run(self, inp: Any) -> Any:
+        # We actually override __call__ instead for multi-step
+        # but this function is never directly used. 
+        pass
+
+    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
         current_ctx = context
-        for i, node in enumerate(self.sub_nodes, 1):
-            print(f"[CompositeNode {self.name}] => Sub-node {i} ({node.name})")
+        for i, node in enumerate(self.nodes, 1):
+            print(f"[CompositeNode] Step {i} -> Node {node}")
             current_ctx = node(current_ctx)
-        print(f"[CompositeNode {self.name}] Sequence result: {current_ctx}")
         return current_ctx
 
-class AddOneNode(Node):
-    """
-    A Node that adds 'amount' to context["value"].
-    """
-    def __init__(
-        self,
-        name: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        sub_nodes: Optional[List[Node]] = None,
-        node_type: Optional[str] = None
-    ):
-        super().__init__(name, params, sub_nodes, node_type)
-        self.amount = self.params.get("amount", 1)
+    def __repr__(self):
+        return f"CompositeNode(len={len(self.nodes)})"
 
-    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        new_ctx = dict(context)
-        old_val = new_ctx.get("value", 0)
-        new_ctx["value"] = old_val + self.amount
-        print(f"[AddOneNode {self.name}] {old_val} + {self.amount} -> {new_ctx['value']}")
-        return new_ctx
+    def to_config(self) -> Dict[str, Any]:
+        """
+        We'll store sub-nodes in config["sub_nodes"], each as a to_json() dict.
+        """
+        return {
+            "sub_nodes": [n.to_json() for n in self.nodes]
+        }
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "CompositeNode":
+        sub_nodes_data = config["sub_nodes"]
+        # Rebuild each sub-node
+        sub_nodes = [Node.from_json(d) for d in sub_nodes_data]
+        return CompositeNode(sub_nodes)
 
 
-class MultiplyNode(Node):
-    """
-    A Node that multiplies context["value"] by a factor.
-    """
-    def __init__(
-        self,
-        name: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        sub_nodes: Optional[List[Node]] = None,
-        node_type: Optional[str] = None
-    ):
-        super().__init__(name, params, sub_nodes, node_type)
-        self.factor = self.params.get("factor", 2)
+##############################################################################
+# 5) Example typed Nodes
+##############################################################################
 
-    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        new_ctx = dict(context)
-        old_val = new_ctx.get("value", 1)
-        new_ctx["value"] = old_val * self.factor
-        print(f"[MultiplyNode {self.name}] {old_val} * {self.factor} -> {new_ctx['value']}")
-        return new_ctx
-
-class AskUserNode(Node):
+class GreetNode(Node[PersonInput, GreetingOutput]):
     """
-    A Node that pauses execution to ask the user a question, collects the answer,
-    and stores it in the context. This simulates a 'tool call' to clarify details
-    with a human user.
-    
-    Example param:
-      "params": {
-        "question": "Do you want to continue? (yes/no)"
-        "target_key": "user_response"
-      }
+    Transform: PersonInput -> GreetingOutput
     """
-    
-    def __init__(
-        self,
-        name: Optional[str] = None,
-        params: Optional[Dict[str, Any]] = None,
-        sub_nodes: Optional[List[Node]] = None,
-        node_type: Optional[str] = None
-    ):
-        super().__init__(name, params, sub_nodes, node_type)
-        self.question = self.params.get("question", "Your input?")
-        self.target_key = self.params.get("target_key", "user_response")
 
-    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        # We "call a tool" here. In a real system, this might be a Slack message,
-        # a web form, or an external service. For simplicity, we use input().
-        print(f"[AskUserNode {self.name}] Asking user: {self.question}")
-        user_reply = input(f"{self.question} ")  # CLI prompt
-        new_ctx = dict(context)
-        new_ctx[self.target_key] = user_reply
-        print(f"[AskUserNode {self.name}] Received '{user_reply}' and stored in '{self.target_key}'.")
-        return new_ctx
+    def __init__(self, greeting_format: str = "Hello {name}, age {age}!"):
+        super().__init__()
+        self.greeting_format = greeting_format
+
+    @property
+    def in_schema(self) -> Type[PersonInput]:
+        return PersonInput
+
+    @property
+    def out_schema(self) -> Type[GreetingOutput]:
+        return GreetingOutput
+
+    def run(self, inp: PersonInput) -> GreetingOutput:
+        greeting_str = self.greeting_format.format(name=inp.name, age=inp.age)
+        return GreetingOutput(greeting=greeting_str)
+
+    def __repr__(self):
+        return f"GreetNode(format='{self.greeting_format}')"
+
+    # -- Serialization for GreetNode --
+
+    def to_config(self) -> Dict[str, Any]:
+        return {
+            "greeting_format": self.greeting_format
+        }
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "GreetNode":
+        greeting_format = config.get("greeting_format", "Hello {name}, age {age}!")
+        return GreetNode(greeting_format)
+
+
+class ColorNode(Node[GreetingOutput, FavoriteColorOutput]):
+    """
+    Transform: GreetingOutput -> FavoriteColorOutput
+    """
+
+    def __init__(self, color: str = "blue"):
+        super().__init__()
+        self.color = color
+
+    @property
+    def in_schema(self) -> Type[GreetingOutput]:
+        return GreetingOutput
+
+    @property
+    def out_schema(self) -> Type[FavoriteColorOutput]:
+        return FavoriteColorOutput
+
+    def run(self, inp: GreetingOutput) -> FavoriteColorOutput:
+        # In reality, you'd do something with 'inp.greeting' or self.color
+        # Here we just produce a static color for demonstration.
+        return FavoriteColorOutput(favorite_color=self.color)
+
+    def __repr__(self):
+        return f"ColorNode(color='{self.color}')"
+
+    # -- Serialization for ColorNode --
+
+    def to_config(self) -> Dict[str, Any]:
+        return {
+            "color": self.color
+        }
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> "ColorNode":
+        color = config.get("color", "blue")
+        return ColorNode(color)
+
+
+##############################################################################
+# 6) Demo
+##############################################################################
 
 if __name__ == "__main__":
-    # 1. Build a pipeline that:
-    #    - Adds 5,
-    #    - Asks the user if they want to double,
-    #    - If so, multiplies by 2
-    #
-    # For demonstration, the "if so" is not automatically enforced here,
-    # but you could extend this to do branching logic. Right now, we'll
-    # just record user input and run both nodes unconditionally.
-
-    add_node = AddOneNode(
-        name="AddFive",
-        params={"amount": 5}
-    )
-    ask_node = AskUserNode(
-        name="AskUser",
-        params={
-            "question": "Do you want to double the value? (yes/no)",
-            "target_key": "user_decision"
-        }
-    )
-    multiply_node = MultiplyNode(
-        name="DoubleValue",
-        params={"factor": 2}
-    )
+    greet_node = GreetNode("Hello {name}, who is {age} years old.")
+    color_node = ColorNode(color="green")
     
-    # Compose them in a pipeline
-    pipeline = add_node >> ask_node >> multiply_node
+    # Compose them
+    pipeline = greet_node >> color_node
+    
+    # Run
+    ctx = {"name": "Alice", "age": 30}
+    final = pipeline(ctx)
+    print(f"\nFinal context: {final}")
+    
+    # Serialize
+    pipeline_json = pipeline.to_json()
+    json_str = json.dumps(pipeline_json, indent=2)
+    print("\n--- Pipeline JSON ---")
+    print(json_str)
 
-    # 2. Run it on an initial context
-    initial_context = {"value": 10}
-    print("\n--- Running Pipeline with User Clarification ---")
-    final_context = pipeline(initial_context)
-    print(f"Pipeline finished. Final context: {final_context}")
+    # Deserialize
+    loaded_data = json.loads(json_str)
+    restored_pipeline = Node.from_json(loaded_data)
 
-    # 3. Serialize to JSON
-    pipeline_data = pipeline.to_json()
-    pipeline_json = json.dumps(pipeline_data, indent=2)
-    print("\n--- Pipeline Serialized to JSON ---")
-    print(pipeline_json)
-
-    # 4. Deserialize
-    restored_data = json.loads(pipeline_json)
-    restored_pipeline = Node.from_json(restored_data)
-
-    # 5. Run again (will ask the user again)
-    print("\n--- Running Restored Pipeline ---")
-    second_context = {"value": 100}
-    second_final = restored_pipeline(second_context)
-    print(f"Restored pipeline finished. Final context: {second_final}")
+    # Run again
+    ctx2 = {"name": "Bob", "age": 25}
+    final2 = restored_pipeline(ctx2)
+    print(f"\nFinal context from restored pipeline: {final2}")
