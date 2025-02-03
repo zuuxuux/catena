@@ -1,19 +1,10 @@
-"""
-Example DSL with dynamic import, parameterized Nodes, and JSON serialization.
-
-Basic Usage:
-  1. Define specialized Node subclasses (e.g., AddOneNode) that store parameters.
-  2. Use nodeA >> nodeB to create a composite node.
-  3. Serialize to JSON, then deserialize to reconstruct the full pipeline.
-"""
-
 import importlib
 import json
 from typing import Any, Dict, List, Optional
 
 
 ##############################################################################
-# Helper for Dynamic Import
+# Dynamic Import Helper
 ##############################################################################
 
 def dynamic_import(fully_qualified_name: str):
@@ -39,6 +30,11 @@ class Node:
     - params: a dict of constructor parameters (JSON-serializable)
     - sub_nodes: child nodes if this node is a "composite"
     - node_type: a fully qualified Python class path (for dynamic import)
+    
+    By default, this Node does:
+      1) If sub_nodes exist, run them in sequence on the context.
+      2) Otherwise, do nothing (identity pass).
+    Subclasses override __call__ to implement custom logic.
     """
     
     def __init__(
@@ -52,8 +48,6 @@ class Node:
         self.params = params or {}
         self.sub_nodes = sub_nodes or []
         
-        # By default, store the *current* class's fully qualified name.
-        # A subclass can override or set this differently if needed.
         if node_type is None:
             cls = self.__class__
             self.node_type = f"{cls.__module__}.{cls.__name__}"
@@ -62,10 +56,8 @@ class Node:
 
     def __call__(self, context: Any) -> Any:
         """
-        Default behavior: If we have sub_nodes, run them in sequence.
-        Otherwise, do nothing (identity).
-        
-        Subclasses will override this to provide real transformations.
+        Default behavior: if sub_nodes exist, run them in order;
+        otherwise, return context unchanged.
         """
         if self.sub_nodes:
             current_ctx = context
@@ -73,13 +65,12 @@ class Node:
                 current_ctx = node(current_ctx)
             return current_ctx
         else:
-            # Identity pass (override in child classes to do actual transformations).
-            return context
+            return context  # identity
 
     def __rshift__(self, other: "Node") -> "Node":
         """
-        Compose self >> other: returns a Node that runs 'self' then 'other'.
-        We do this by building a 'CompositeNode' or by directly storing sub_nodes.
+        Compose self >> other: returns a CompositeNode that runs
+        'self' then 'other' in sequence.
         """
         return CompositeNode(
             name=f"({self.name} >> {other.name})",
@@ -88,7 +79,7 @@ class Node:
 
     def to_json(self) -> Dict[str, Any]:
         """
-        Serialize the Node to a JSON-friendly dict.
+        Serialize to a JSON-friendly dict. 
         """
         return {
             "node_type": self.node_type,
@@ -100,13 +91,12 @@ class Node:
     @classmethod
     def from_json(cls, data: Dict[str, Any]) -> "Node":
         """
-        Deserialize a Node from a JSON-friendly dict by:
-          1. Importing the 'node_type'
-          2. Instantiating with the stored 'params'
-          3. Recursively building 'sub_nodes'
+        Deserialize a Node from a JSON dict by:
+          1. dynamic_import(node_type)
+          2. constructing that class with the stored 'params' and 'sub_nodes'
         """
         node_type = data["node_type"]
-        NodeClass = dynamic_import(node_type)  # load the actual class
+        node_cls = dynamic_import(node_type)  # load the actual class
 
         sub_nodes_data = data.get("sub_nodes", [])
         child_nodes = [cls.from_json(sd) for sd in sub_nodes_data]
@@ -114,8 +104,8 @@ class Node:
         name = data["name"]
         params = data["params"]
 
-        # We instantiate NodeClass with the same signature used in the constructor
-        node_obj = NodeClass(
+        # Instantiate
+        node_obj = node_cls(
             name=name,
             params=params,
             sub_nodes=child_nodes,
@@ -130,16 +120,15 @@ class Node:
 
 class CompositeNode(Node):
     """
-    A Node that runs its sub_nodes in sequence. 
-    For demonstration, we override __call__ to show logs or custom logic.
+    A Node that runs its sub_nodes in sequence.
     """
     def __call__(self, context: Any) -> Any:
-        print(f"[CompositeNode {self.name}] Starting composition.")
+        print(f"[CompositeNode {self.name}] Starting sequence.")
         current_ctx = context
         for i, node in enumerate(self.sub_nodes, 1):
             print(f"[CompositeNode {self.name}] => Sub-node {i} ({node.name})")
             current_ctx = node(current_ctx)
-        print(f"[CompositeNode {self.name}] Final result: {current_ctx}")
+        print(f"[CompositeNode {self.name}] Sequence result: {current_ctx}")
         return current_ctx
 
 
@@ -150,11 +139,7 @@ class CompositeNode(Node):
 class AddOneNode(Node):
     """
     A Node that adds 'amount' to context["value"].
-    
-    Instead of storing a function pointer, we store a parameter "amount"
-    that we can easily serialize. 
     """
-
     def __init__(
         self,
         name: Optional[str] = None,
@@ -162,15 +147,10 @@ class AddOneNode(Node):
         sub_nodes: Optional[List[Node]] = None,
         node_type: Optional[str] = None
     ):
-        # We expect params to contain "amount"
         super().__init__(name, params, sub_nodes, node_type)
-        # Our own property for convenience
-        self.amount = params.get("amount", 1) if params else 1
+        self.amount = self.params.get("amount", 1)
 
     def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Adds self.amount to context["value"].
-        """
         new_ctx = dict(context)
         old_val = new_ctx.get("value", 0)
         new_ctx["value"] = old_val + self.amount
@@ -186,7 +166,6 @@ class MultiplyNode(Node):
     """
     A Node that multiplies context["value"] by a factor.
     """
-
     def __init__(
         self,
         name: Optional[str] = None,
@@ -195,12 +174,9 @@ class MultiplyNode(Node):
         node_type: Optional[str] = None
     ):
         super().__init__(name, params, sub_nodes, node_type)
-        self.factor = params.get("factor", 2) if params else 2
+        self.factor = self.params.get("factor", 2)
 
     def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Multiplies context["value"] by self.factor.
-        """
         new_ctx = dict(context)
         old_val = new_ctx.get("value", 1)
         new_ctx["value"] = old_val * self.factor
@@ -209,39 +185,95 @@ class MultiplyNode(Node):
 
 
 ##############################################################################
+# Example: AskUserNode (Tool Usage)
+##############################################################################
+
+class AskUserNode(Node):
+    """
+    A Node that pauses execution to ask the user a question, collects the answer,
+    and stores it in the context. This simulates a 'tool call' to clarify details
+    with a human user.
+    
+    Example param:
+      "params": {
+        "question": "Do you want to continue? (yes/no)"
+        "target_key": "user_response"
+      }
+    """
+    
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        sub_nodes: Optional[List[Node]] = None,
+        node_type: Optional[str] = None
+    ):
+        super().__init__(name, params, sub_nodes, node_type)
+        self.question = self.params.get("question", "Your input?")
+        self.target_key = self.params.get("target_key", "user_response")
+
+    def __call__(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        # We "call a tool" here. In a real system, this might be a Slack message,
+        # a web form, or an external service. For simplicity, we use input().
+        print(f"[AskUserNode {self.name}] Asking user: {self.question}")
+        user_reply = input(f"{self.question} ")  # CLI prompt
+        new_ctx = dict(context)
+        new_ctx[self.target_key] = user_reply
+        print(f"[AskUserNode {self.name}] Received '{user_reply}' and stored in '{self.target_key}'.")
+        return new_ctx
+
+
+##############################################################################
 # Demo
 ##############################################################################
 
 if __name__ == "__main__":
-    # 1. Create some parameterized Node objects
-    nodeA = AddOneNode(name="AddThree", params={"amount": 3})
-    nodeB = MultiplyNode(name="TimesTen", params={"factor": 10})
+    # 1. Build a pipeline that:
+    #    - Adds 5,
+    #    - Asks the user if they want to double,
+    #    - If so, multiplies by 2
+    #
+    # For demonstration, the "if so" is not automatically enforced here,
+    # but you could extend this to do branching logic. Right now, we'll
+    # just record user input and run both nodes unconditionally.
+
+    add_node = AddOneNode(
+        name="AddFive",
+        params={"amount": 5}
+    )
+    ask_node = AskUserNode(
+        name="AskUser",
+        params={
+            "question": "Do you want to double the value? (yes/no)",
+            "target_key": "user_decision"
+        }
+    )
+    multiply_node = MultiplyNode(
+        name="DoubleValue",
+        params={"factor": 2}
+    )
     
-    # 2. Compose them
-    pipeline = nodeA >> nodeB
-    """
-    pipeline will be a CompositeNode with sub_nodes = [nodeA, nodeB].
-    We could also directly do:  CompositeNode(sub_nodes=[nodeA, nodeB])
-    """
-    
-    # 3. Run the pipeline
-    initial_context = {"value": 5}
-    print("\n--- Running Pipeline ---")
-    result = pipeline(initial_context)
-    print(f"Final result context: {result}\n")
-    
-    # 4. Serialize to JSON
-    pipeline_dict = pipeline.to_json()
-    pipeline_json = json.dumps(pipeline_dict, indent=2)
-    print("--- Pipeline Serialized to JSON ---")
+    # Compose them in a pipeline
+    pipeline = add_node >> ask_node >> multiply_node
+
+    # 2. Run it on an initial context
+    initial_context = {"value": 10}
+    print("\n--- Running Pipeline with User Clarification ---")
+    final_context = pipeline(initial_context)
+    print(f"Pipeline finished. Final context: {final_context}")
+
+    # 3. Serialize to JSON
+    pipeline_data = pipeline.to_json()
+    pipeline_json = json.dumps(pipeline_data, indent=2)
+    print("\n--- Pipeline Serialized to JSON ---")
     print(pipeline_json)
-    
-    # 5. Deserialize from JSON
-    restored_dict = json.loads(pipeline_json)
-    restored_pipeline = Node.from_json(restored_dict)
-    
-    # 6. Run the restored pipeline again
+
+    # 4. Deserialize
+    restored_data = json.loads(pipeline_json)
+    restored_pipeline = Node.from_json(restored_data)
+
+    # 5. Run again (will ask the user again)
     print("\n--- Running Restored Pipeline ---")
-    new_context = {"value": 100}
-    restored_result = restored_pipeline(new_context)
-    print(f"Restored pipeline final result: {restored_result}\n")
+    second_context = {"value": 100}
+    second_final = restored_pipeline(second_context)
+    print(f"Restored pipeline finished. Final context: {second_final}")
